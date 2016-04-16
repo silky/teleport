@@ -157,7 +157,7 @@ func (w *connectHandler) connectUpstream() (*sshutils.Upstream, error) {
 	return up, nil
 }
 
-func (w *connectHandler) Handler() http.Handler {
+func (w *connectHandler) NewWebsocketHandler() http.Handler {
 	// TODO(klizhentas)
 	// we instantiate a server explicitly here instead of using
 	// websocket.HandlerFunc to set empty origin checker

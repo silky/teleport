@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package web implements web proxy handler that provides
-// web interface to view and connect to teleport nodes
+// Web API used by the web UI.
 package web
 
 import (
@@ -759,7 +758,7 @@ func (m *Handler) siteNodeConnect(w http.ResponseWriter, r *http.Request, p http
 	// sessionContext that owns them expires
 	ctx.AddClosers(connect)
 	defer connect.Close()
-	connect.Handler().ServeHTTP(w, r)
+	connect.NewWebsocketHandler().ServeHTTP(w, r)
 	return nil, nil
 }
 

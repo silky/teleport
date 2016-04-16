@@ -21,6 +21,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -33,126 +35,273 @@ import (
 	"github.com/gravitational/trace"
 )
 
-func New(path string) (*boltRecorder, error) {
-	br := boltRecorder{
-		path: path,
-		dbs:  make(map[string]*boltRW),
-	}
-	path, err := filepath.Abs(path)
+// clientType enum defines which DB client is being requested: reader or a writer
+type clientType int
+
+const (
+	typeReader = iota // 0
+	typeWriter        // 1
+	typeBoth          // 2
+)
+
+var (
+	streamBufSize = 5
+	// iterBucket is the name of the bucket in BoltDB where iterator
+	// position is stored
+	iterBucket = []string{"iter"}
+	// iterKey is the key name inside 'iter' bucket where iteration
+	// position is stored
+	iterKey = []byte("val")
+)
+
+// New creates a new session recorder based on BoltDB. dirPath is the target
+// directory where BoltDB files will be created, one per session.
+func New(dirPath string) (*boltRecorder, error) {
+	dirPath, err := filepath.Abs(dirPath)
 	if err != nil {
 		return nil, trace.Wrap(err, "failed to convert path")
 	}
-	if err := os.MkdirAll(path, 0777); err != nil {
+	if err := os.MkdirAll(dirPath, 0777); err != nil {
 		return nil, trace.Wrap(
-			err, fmt.Sprintf("failed to create '%v' for session records", path))
+			err, fmt.Sprintf("failed to create '%v' for session records", dirPath))
 	}
-	// test if path is writeable
-	testRef, err := br.getRef("testRecord")
+	// try creating a file in there to see if we have access:
+	f, err := ioutil.TempFile(dirPath, "teleportsession")
 	if err != nil {
+		log.Error(err)
 		return nil, trace.Wrap(err)
 	}
-	err = testRef.WriteChunks([]recorder.Chunk{recorder.Chunk{
-		Data: []byte{1, 2, 3},
-	}})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if err := br.decRef(testRef.rw); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return &br, nil
+	f.Close()
+	defer os.Remove(f.Name())
+	return &boltRecorder{
+		path:     dirPath,
+		sessions: make(map[string]*boltSession),
+	}, nil
 }
 
+// boltRecorder implements recorder.Recorder interface using a single BoltDB database
+// for every session.
 type boltRecorder struct {
 	sync.Mutex
+
+	// path is the directory where all BoltDB database files reside
 	path string
-	dbs  map[string]*boltRW
+
+	// session is a map of sessionID -> boltSession
+	sessions map[string]*boltSession
 }
 
-func (r *boltRecorder) Close() error {
+// boltSession represents an opened BoltDB database. It must be closed when
+// a list of active clients (callers who requested Readers and Writers) becomes
+// empty
+type boltSession struct {
+	sync.Mutex
+	id       string
+	db       *bolt.DB
+	recorder *boltRecorder
+
+	// list of callers who requested Writers and Readers. when this lsit
+	// becomes empty, the session must be closed (and BoltDB too)
+	activeClients []*boltSessionClient
+}
+
+// addClient adds a new reader or writer to the list of connected clients
+// of this session.
+func (s *boltSession) addClient(ct clientType) *boltSessionClient {
+	c := &boltSessionClient{session: s, clientType: ct}
+	s.Lock()
+	defer s.Unlock()
+	s.activeClients = append(s.activeClients, c)
+	return c
+}
+
+// activeSessions returns a number of opened BoltDB files
+func (r *boltRecorder) activeSessions() int {
 	r.Lock()
 	defer r.Unlock()
+	return len(r.sessions)
+}
 
-	for _, db := range r.dbs {
-		if err := db.Close(); err != nil {
+// removeClient is called when a previously issued Reader or Writer gets
+// closed
+func (s *boltSession) removeClient(c *boltSessionClient) error {
+	s.Lock()
+	defer s.Unlock()
+
+	for i, el := range s.activeClients {
+		if el == c {
+			s.activeClients = append(s.activeClients[:i], s.activeClients[i+1:]...)
+			break
+		}
+	}
+
+	// no more clients? we need to close this DB
+	if len(s.activeClients) == 0 {
+		s.recorder.removeSession(s.id)
+	}
+	return nil
+}
+
+// boltSessionClient represents a connected reader or writer to a BotlDB
+type boltSessionClient struct {
+	// implemnts this interface. When .Close() is called, it removes itself
+	// from the list of connected clients on the parent session
+	recorder.ChunkReadWriteCloser
+
+	// parent session
+	session *boltSession
+
+	// clientType indicates if its' a reader or a writer or both
+	clientType clientType
+}
+
+// removeSession removes a session from the recorder
+func (r *boltRecorder) removeSession(sid string) {
+	r.Lock()
+	defer r.Unlock()
+	s, found := r.sessions[sid]
+	if s != nil && found {
+		// close BoltDB:
+		err := s.db.Close()
+		if err != nil {
 			log.Error(err)
 		}
 	}
-	r.dbs = nil
-	return nil
+	delete(r.sessions, sid)
+	log.Infof("bolt recorder: session '%v' garbage-collected", sid)
 }
 
-func (r *boltRecorder) decRef(b *boltRW) error {
+// sessionFor returns a "DB session" for a given session ID. It will
+// return an existing one, or create a new one
+func (r *boltRecorder) sessionFor(sid string) (*boltSession, error) {
 	r.Lock()
 	defer r.Unlock()
-
-	b.refs -= 1
-	if b.refs == 0 {
-		delete(r.dbs, b.id)
-		return b.Close()
-	}
-	return nil
-}
-
-func (r *boltRecorder) getRef(id string) (*boltRef, error) {
-	r.Lock()
-	defer r.Unlock()
-
-	wr, ok := r.dbs[id]
-	var err error
-	if !ok {
-		wr, err = newBoltRW(id, filepath.Join(r.path, id))
+	session, found := r.sessions[sid]
+	if !found {
+		db, err := r.openDatabase(sid)
 		if err != nil {
-			return nil, err
+			return nil, trace.Wrap(err)
 		}
-	} else {
-		log.Infof("boltRecorder: getRef %v", id)
-		wr.refs += 1
+		session = &boltSession{
+			activeClients: make([]*boltSessionClient, 0),
+			db:            db,
+			id:            sid,
+			recorder:      r,
+		}
+		r.sessions[sid] = session
 	}
-	r.dbs[id] = wr
-	return &boltRef{r: r, rw: wr}, nil
+	return session, nil
 }
 
-func (r *boltRecorder) GetChunkWriter(id string) (recorder.ChunkWriteCloser, error) {
-	return r.getRef(id)
-}
+// openDatabase opens or creates a new BoltDB database for a given session ID
+func (r *boltRecorder) openDatabase(sid string) (*bolt.DB, error) {
+	dbFilePath := filepath.Join(r.path, sid)
+	log.Infof("boltrecorder.openDatabase(%v)", dbFilePath)
 
-func (r *boltRecorder) GetChunkReader(id string) (recorder.ChunkReadCloser, error) {
-	return r.getRef(id)
-}
-
-func newBoltRW(id, path string) (*boltRW, error) {
-	db, err := bolt.Open(path, 0600, nil)
+	// open database
+	db, err := bolt.Open(dbFilePath, 0600, nil)
 	if err != nil {
-		return nil, err
+		return nil, trace.Wrap(err)
 	}
-	wr := &boltRW{
-		id:   id,
-		db:   db,
-		refs: 1,
+	// cleanup helper to be called on critical errors below
+	cleanupIf := func(err error) error {
+		if err != nil {
+			db.Close()
+			os.Remove(dbFilePath)
+			log.Error(err)
+		}
+		return err
 	}
-	if err := wr.initWriteIter(); err != nil {
-		return nil, err
-	}
-	return wr, nil
-}
-
-type boltRW struct {
-	id   string
-	db   *bolt.DB
-	refs int
-}
-
-func (b *boltRW) GetChunksCount() (uint64, error) {
-	var lastChunk uint64
-	err := b.db.View(func(tx *bolt.Tx) error {
-		bkt, err := boltbk.GetBucket(tx, []string{"iter"})
+	// read the current iterator value:
+	err = db.View(func(tx *bolt.Tx) error {
+		bkt, err := boltbk.GetBucket(tx, iterBucket)
 		if err != nil {
 			return err
 		}
-		bytes := bkt.Get([]byte("val"))
+		bytes := bkt.Get(iterKey)
+		if bytes == nil {
+			return trace.NotFound("not found")
+		}
+		return nil
+	})
+	if err != nil {
+		// some other error: clean up and return
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(cleanupIf(err))
+		}
+		// drop '0' as the current iterator value:
+		err = db.Update(func(tx *bolt.Tx) error {
+			bkt, err := boltbk.UpsertBucket(tx, iterBucket)
+			if err != nil {
+				return err
+			}
+			var bin = make([]byte, 8)
+			binary.BigEndian.PutUint64(bin, 0)
+			return bkt.Put(iterKey, bin)
+		})
+		if err != nil {
+			return nil, trace.Wrap(cleanupIf(err))
+		}
+	}
+	return db, nil
+}
+
+// Close closes all BoltDB instances
+func (r *boltRecorder) Close() error {
+	cloneSessions := func() []*boltSession {
+		r.Lock()
+		defer r.Unlock()
+		localCopy := make([]*boltSession, len(r.sessions))
+		i := 0
+		for _, s := range r.sessions {
+			localCopy[i] = s
+			i++
+		}
+		r.sessions = make(map[string]*boltSession)
+		return localCopy
+	}
+	// copy all active sessions into a local slice (to minimize total lock time),
+	// then close them all
+	for _, s := range cloneSessions() {
+		for _, client := range s.activeClients {
+			err := client.Close()
+			if err != nil {
+				log.Error(err)
+			}
+		}
+	}
+	return nil
+}
+
+// GetChunkWriter creates and returns a new chunk writer object
+func (r *boltRecorder) GetChunkWriter(sid string) (recorder.ChunkWriteCloser, error) {
+	session, err := r.sessionFor(sid)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	log.Infof("boltRecorder.getChunkWriter(%v) -> %p", sid, session)
+	return session.addClient(typeWriter), nil
+}
+
+// GetChunkWriter creates and returns a new chunk reader object
+func (r *boltRecorder) GetChunkReader(sid string) (recorder.ChunkReadCloser, error) {
+	session, err := r.sessionFor(sid)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	log.Infof("boltRecorder.getChunkReader(%v) -> %p", sid, session)
+	return session.addClient(typeReader), nil
+}
+
+func (c *boltSessionClient) GetChunksCount() (uint64, error) {
+	db := c.session.db
+	var lastChunk uint64
+	err := db.View(func(tx *bolt.Tx) error {
+		bkt, err := boltbk.GetBucket(tx, iterBucket)
+		if err != nil {
+			return err
+		}
+		bytes := bkt.Get(iterKey)
 		if bytes == nil {
 			return trace.NotFound("not found")
 		}
@@ -162,45 +311,14 @@ func (b *boltRW) GetChunksCount() (uint64, error) {
 	return lastChunk, trace.Wrap(err)
 }
 
-func (b *boltRW) initWriteIter() error {
-	var val []byte
-	err := b.db.View(func(tx *bolt.Tx) error {
-		bkt, err := boltbk.GetBucket(tx, []string{"iter"})
+func (c *boltSessionClient) WriteChunks(ch []recorder.Chunk) error {
+	db := c.session.db
+	return db.Update(func(tx *bolt.Tx) error {
+		ibkt, err := boltbk.GetBucket(tx, iterBucket)
 		if err != nil {
 			return err
 		}
-		bytes := bkt.Get([]byte("val"))
-		if bytes == nil {
-			return trace.NotFound("not found")
-		}
-		val = make([]byte, len(bytes))
-		copy(val, bytes)
-		return nil
-	})
-	if err == nil {
-		return nil
-	}
-	if !trace.IsNotFound(err) {
-		return err
-	}
-	return b.db.Update(func(tx *bolt.Tx) error {
-		bkt, err := boltbk.UpsertBucket(tx, []string{"iter"})
-		if err != nil {
-			return err
-		}
-		var bin = make([]byte, 8)
-		binary.BigEndian.PutUint64(bin, 0)
-		return bkt.Put([]byte("val"), bin)
-	})
-}
-
-func (b *boltRW) WriteChunks(ch []recorder.Chunk) error {
-	return b.db.Update(func(tx *bolt.Tx) error {
-		ibkt, err := boltbk.GetBucket(tx, []string{"iter"})
-		if err != nil {
-			return err
-		}
-		iterb := ibkt.Get([]byte("val"))
+		iterb := ibkt.Get(iterKey)
 		if iterb == nil {
 			return trace.NotFound("iter not found")
 		}
@@ -221,13 +339,14 @@ func (b *boltRW) WriteChunks(ch []recorder.Chunk) error {
 				return err
 			}
 		}
-		return ibkt.Put([]byte("val"), bin)
+		return ibkt.Put(iterKey, bin)
 	})
 }
 
-func (b *boltRW) ReadChunk(chunk uint64) ([]byte, error) {
+func (c *boltSessionClient) ReadChunk(chunk uint64) ([]byte, error) {
+	db := c.session.db
 	var bt []byte
-	err := b.db.View(func(tx *bolt.Tx) error {
+	err := db.View(func(tx *bolt.Tx) error {
 		bin := make([]byte, 8)
 		binary.BigEndian.PutUint64(bin, chunk)
 		cbkt, err := boltbk.GetBucket(tx, []string{"chunks"})
@@ -248,27 +367,14 @@ func (b *boltRW) ReadChunk(chunk uint64) ([]byte, error) {
 	return bt, nil
 }
 
-func (fw *boltRW) Close() error {
-	return fw.db.Close()
+func (c *boltSessionClient) Close() error {
+	return c.session.removeClient(c)
 }
 
-type boltRef struct {
-	rw *boltRW
-	r  *boltRecorder
-}
-
-func (r *boltRef) Close() error {
-	return r.r.decRef(r.rw)
-}
-
-func (r *boltRef) GetChunksCount() (uint64, error) {
-	return r.rw.GetChunksCount()
-}
-
-func (r *boltRef) ReadChunks(start int, end int) ([]recorder.Chunk, error) {
+func (c *boltSessionClient) ReadChunks(start int, end int) ([]recorder.Chunk, error) {
 	chunks := []recorder.Chunk{}
 	for i := start; i < end; i++ {
-		out, err := r.rw.ReadChunk(uint64(i))
+		out, err := c.ReadChunk(uint64(i))
 		if err != nil {
 			if trace.IsNotFound(err) {
 				return chunks, nil
@@ -284,6 +390,6 @@ func (r *boltRef) ReadChunks(start int, end int) ([]recorder.Chunk, error) {
 	return chunks, nil
 }
 
-func (r *boltRef) WriteChunks(ch []recorder.Chunk) error {
-	return r.rw.WriteChunks(ch)
+func (c *boltSessionClient) GetStreamReader() io.Reader {
+	return nil
 }

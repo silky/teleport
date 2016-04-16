@@ -34,7 +34,6 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -530,19 +529,14 @@ func NewTunClient(authServers []utils.NetAddr, user string, authMethods []ssh.Au
 	for _, o := range opts {
 		o(tc)
 	}
-	tr := &http.Transport{
-		Dial: tc.Dial,
-	}
-	clt, err := NewClient(
-		"http://stub:0",
-		roundtrip.HTTPClient(&http.Client{
-			Transport: tr,
-		}))
+	clt, err := NewClient("http://stub:0", tc.Dial)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	tc.Client = *clt
-	tc.tr = tr
+	tc.tr = &http.Transport{
+		Dial: tc.Dial,
+	}
 
 	// use local information about auth servers if it's available
 	if tc.addrStorage != nil {

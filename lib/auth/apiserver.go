@@ -19,10 +19,13 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
+
+	"golang.org/x/net/websocket"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/backend"
@@ -121,6 +124,7 @@ func NewAPIServer(a *AuthWithRoles) *APIServer {
 	srv.POST("/v1/records/:sid/chunks", httplib.MakeHandler(srv.submitChunks))
 	srv.GET("/v1/records/:sid/chunks", httplib.MakeHandler(srv.getChunks))
 	srv.GET("/v1/records/:sid/chunkscount", httplib.MakeHandler(srv.getChunksCount))
+	srv.GET("/v1/records/:sid/stream", srv.getSessionStream)
 
 	// Sesssions
 	srv.POST("/v1/sessions/:id/parties", httplib.MakeHandler(srv.upsertSessionParty))
@@ -518,13 +522,11 @@ func (s *APIServer) submitEvents(w http.ResponseWriter, r *http.Request, _ httpr
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
-
 	for _, e := range req.Events {
 		if err := s.a.LogEntry(e); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
-
 	return message("events submitted"), nil
 }
 
@@ -618,6 +620,41 @@ func (s *APIServer) getChunks(w http.ResponseWriter, r *http.Request, p httprout
 		return nil, trace.Wrap(err)
 	}
 	return chunks, nil
+}
+
+func (s *APIServer) getSessionStream(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	const invalidSession = "invalid session ID"
+	// find session by ID:
+	sid, err := session.ParseID(p.ByName("sid"))
+	if err != nil {
+		http.Error(w, invalidSession, http.StatusNotFound)
+		return
+	}
+	session, err := s.a.GetSession(*sid)
+	if err != nil || session == nil {
+		http.Error(w, invalidSession, http.StatusNotFound)
+		return
+	}
+	// get the chunk reader
+	chunkReader, err := s.a.GetChunkReader(sid.String())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer chunkReader.Close()
+
+	// start streaming:
+	ws := &websocket.Server{
+		Handler: func(wc *websocket.Conn) {
+			written, err := io.Copy(wc, chunkReader.GetStreamReader())
+			if err != nil {
+				log.Error(err)
+				return
+			}
+			log.Infof("Chunk reader sent %v bytes to a client via web socket", written)
+		},
+	}
+	ws.ServeHTTP(w, r)
 }
 
 func (s *APIServer) getChunksCount(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {

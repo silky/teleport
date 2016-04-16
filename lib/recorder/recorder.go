@@ -54,6 +54,11 @@ type ChunkReader interface {
 	// ReadChunks returns a list of chunks from start to end indexes
 	ReadChunks(start int, end int) ([]Chunk, error)
 	GetChunksCount() (uint64, error)
+
+	// GetStreamReader returns io.Reader interface which streams session
+	// bytes in real time without delays (useful for live streams or for
+	// efficient downloads of acrhived sessions)
+	GetStreamReader() io.Reader
 }
 
 // ChunkReadCloser implements chunk reader + adds closer

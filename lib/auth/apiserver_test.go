@@ -95,7 +95,7 @@ func (s *APISuite) SetUpTest(c *C) {
 			recorder:    s.rec,
 			permChecker: NewAllowAllPermissions(),
 		}))
-	clt, err := NewClient(s.srv.URL)
+	clt, err := NewClient(s.srv.URL, nil)
 	c.Assert(err, IsNil)
 	s.clt = clt
 

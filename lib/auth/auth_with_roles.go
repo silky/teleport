@@ -17,6 +17,7 @@ limitations under the License.
 package auth
 
 import (
+	"io"
 	"net/url"
 	"time"
 
@@ -158,99 +159,107 @@ func (a *AuthWithRoles) GetEvents(filter events.Filter) ([]lunk.Entry, error) {
 		return nil, trace.Wrap(err)
 	}
 	return a.elog.GetEvents(filter)
-
 }
+
 func (a *AuthWithRoles) LogSession(sess session.Session) error {
 	if err := a.permChecker.HasPermission(a.role, ActionUpsertSession); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.elog.LogSession(sess)
-
 }
+
 func (a *AuthWithRoles) GetSessionEvents(filter events.Filter) ([]session.Session, error) {
 	if err := a.permChecker.HasPermission(a.role, ActionGetSessions); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.elog.GetSessionEvents(filter)
-
 }
+
 func (a *AuthWithRoles) GetChunkWriter(id string) (recorder.ChunkWriteCloser, error) {
 	if err := a.permChecker.HasPermission(a.role, ActionGetChunkWriter); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.recorder.GetChunkWriter(id)
-
 }
+
 func (a *AuthWithRoles) GetChunkReader(id string) (recorder.ChunkReadCloser, error) {
 	if err := a.permChecker.HasPermission(a.role, ActionGetChunkReader); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.recorder.GetChunkReader(id)
-
 }
+
+func (a *AuthWithRoles) GetSessionStream(sid string) (io.ReadCloser, error) {
+	if err := a.permChecker.HasPermission(a.role, ActionGetChunkReader); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	// "nil" means "go ahead and stream"
+	return nil, nil
+}
+
 func (a *AuthWithRoles) UpsertNode(s services.Server, ttl time.Duration) error {
 	if err := a.permChecker.HasPermission(a.role, ActionUpsertServer); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertNode(s, ttl)
-
 }
+
 func (a *AuthWithRoles) GetNodes() ([]services.Server, error) {
 	if err := a.permChecker.HasPermission(a.role, ActionGetServers); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetNodes()
-
 }
+
 func (a *AuthWithRoles) UpsertAuthServer(s services.Server, ttl time.Duration) error {
 	if err := a.permChecker.HasPermission(a.role, ActionUpsertAuthServer); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertAuthServer(s, ttl)
-
 }
+
 func (a *AuthWithRoles) GetAuthServers() ([]services.Server, error) {
 	if err := a.permChecker.HasPermission(a.role, ActionGetAuthServers); err != nil {
 		return nil, err
 	}
 	return a.authServer.GetAuthServers()
-
 }
+
 func (a *AuthWithRoles) UpsertProxy(s services.Server, ttl time.Duration) error {
 	if err := a.permChecker.HasPermission(a.role, ActionUpsertProxy); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertProxy(s, ttl)
-
 }
+
 func (a *AuthWithRoles) GetProxies() ([]services.Server, error) {
 	if err := a.permChecker.HasPermission(a.role, ActionGetProxies); err != nil {
 		return nil, err
 	}
 	return a.authServer.GetProxies()
-
 }
+
 func (a *AuthWithRoles) UpsertReverseTunnel(r services.ReverseTunnel, ttl time.Duration) error {
 	if err := a.permChecker.HasPermission(a.role, ActionUpsertReverseTunnel); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertReverseTunnel(r, ttl)
-
 }
+
 func (a *AuthWithRoles) GetReverseTunnels() ([]services.ReverseTunnel, error) {
 	if err := a.permChecker.HasPermission(a.role, ActionGetReverseTunnels); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetReverseTunnels()
-
 }
+
 func (a *AuthWithRoles) DeleteReverseTunnel(domainName string) error {
 	if err := a.permChecker.HasPermission(a.role, ActionDeleteReverseTunnel); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteReverseTunnel(domainName)
-
 }
+
 func (a *AuthWithRoles) UpsertPassword(user string, password []byte) (hotpURL string, hotpQR []byte, err error) {
 	if err := a.permChecker.HasPermission(a.role, ActionUpsertPassword); err != nil {
 		return "", nil, err

@@ -19,9 +19,14 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"time"
+
+	"golang.org/x/net/websocket"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/events"
@@ -40,19 +45,35 @@ import (
 // CurrentVersion is a current API version
 const CurrentVersion = "v1"
 
+type Dialer func(network, addr string) (net.Conn, error)
+
 // Client is HTTP API client that connects to the remote server
 type Client struct {
 	roundtrip.Client
+	dialer Dialer
 }
 
-// NewClient returns a new instance of the client
-func NewClient(addr string, params ...roundtrip.ClientParam) (*Client, error) {
+// NewClient returns a new instance of the client.
+// If 'dialer' is set to nil, the default http.Transport dialer will be used
+func NewClient(addr string, dialer Dialer) (*Client, error) {
 	log.Infof("auth.NewClient(%v)", addr)
+
+	var params []roundtrip.ClientParam
+	if dialer != nil {
+		params = append(params, roundtrip.HTTPClient(&http.Client{
+			Transport: &http.Transport{
+				Dial: dialer,
+			},
+		}))
+	}
 	c, err := roundtrip.NewClient(addr, CurrentVersion, params...)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{*c}, nil
+	return &Client{
+		Client: *c,
+		dialer: dialer,
+	}, nil
 }
 
 // PostJSON is a generic method that issues http POST request to the server
@@ -295,6 +316,31 @@ func (c *Client) GetSessionEvents(filter events.Filter) ([]session.Session, erro
 		return nil, trace.Wrap(err)
 	}
 	return events, nil
+}
+
+// GetSessionStream returns a websocket which can be used to stream a live or
+// recorded session from the auth server
+func (c *Client) GetSessionStream(id string) (io.ReadCloser, error) {
+	// create an underlying SSH connection (we'll use it as a transport for websocket):
+	sshConn, err := c.dialer("tcp", "stub:0")
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	// open websocket client connection, read from it, dump result and exit:
+	destURL, err := url.Parse(c.Endpoint("records", id, "stream"))
+	if err != nil {
+		panic(err)
+	}
+	destURL.Scheme = "ws"
+	wsConfig, err := websocket.NewConfig(destURL.String(), c.Endpoint())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	wsConn, err := websocket.NewClient(wsConfig, sshConn)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return wsConn, nil
 }
 
 // GetChunkWriter returns a writer for chunks (parts of the recorded session)
@@ -764,6 +810,11 @@ type chunkRW struct {
 	id string
 }
 
+func (c *chunkRW) GetStreamReader() io.Reader {
+	// TODO (ev): do we need to implement this?
+	return nil
+}
+
 func (c *chunkRW) ReadChunks(start int, end int) ([]recorder.Chunk, error) {
 	out, err := c.c.Get(c.c.Endpoint("records", c.id, "chunks"), url.Values{
 		"start": []string{strconv.Itoa(start)},
@@ -820,6 +871,7 @@ type ClientI interface {
 	LogEntry(en lunk.Entry) error
 	LogSession(sess session.Session) error
 	GetEvents(filter events.Filter) ([]lunk.Entry, error)
+	GetSessionStream(sid string) (io.ReadCloser, error)
 	GetSessionEvents(filter events.Filter) ([]session.Session, error)
 	GetChunkWriter(id string) (recorder.ChunkWriteCloser, error)
 	GetChunkReader(id string) (recorder.ChunkReadCloser, error)

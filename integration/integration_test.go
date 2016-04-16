@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/user"
 	"strconv"
@@ -291,7 +292,7 @@ func (t *Terminal) Read(p []byte) (n int, err error) {
 			time.Sleep(time.Second)
 			n -= 1
 		}
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 5)
 	}
 	return n, nil
 }
